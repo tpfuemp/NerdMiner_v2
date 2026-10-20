@@ -994,6 +994,12 @@ static inline bool nerd_sha_read_digest_swap_if(uint8_t *hash)
   return true;
 }
 
+// LX6 has no byte-swap instruction, __builtin_bswap32 is a libgcc call
+static inline uint32_t nerd_bswap32(uint32_t x)
+{
+  return (x << 24) | ((x << 8) & 0x00FF0000) | ((x >> 8) & 0x0000FF00) | (x >> 24);
+}
+
 // Busy delay of ~n loop iterations; stalls only make it longer, never shorter
 static inline void nerd_spin(uint32_t n)
 {
@@ -1027,7 +1033,7 @@ static inline uint32_t nerd_hw_scan(const uint32_t *blk, uint32_t nonce, uint32_
     text[0] = blk[16];
     text[1] = blk[17];
     text[2] = blk[18];
-    text[3] = __builtin_bswap32(nonce + i);
+    text[3] = nerd_bswap32(nonce + i);
     text[4] = 0x80000000;
     for (int j = 5; j < 15; ++j)
       text[j] = 0;
