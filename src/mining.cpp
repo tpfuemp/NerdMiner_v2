@@ -19,6 +19,10 @@
 #include "mbedtls/sha256.h"
 #include "i2c_master.h"
 
+// Arduino default is -Os; -O2 makes the CPU/bus bound HW miner loop ~19% faster on
+// classic ESP32. The SW kernel (nerdSHA256plus.cpp) stays -Os, -O2 is slower there.
+#pragma GCC optimize ("O2")
+
 //10 Jobs per second
 #define NONCE_PER_JOB_SW 4096
 #define NONCE_PER_JOB_HW 16*1024
@@ -54,6 +58,17 @@ volatile uint32_t valids; // increased if blockhash <= target
 
 // Track best diff
 double best_diff = 0.0;
+
+#ifdef DEBUG_HASH_STATS
+// Benchmark counters, printed as STATS line for tools/bench_hashrate.py
+static uint32_t s_stat_nonces_sw = 0;                // written by the stratum task only
+static uint32_t s_stat_nonces_hw = 0;                // written by the stratum task only
+#endif
+#ifdef DEBUG_HW_WAIT_STATS
+// Diagnosis only, costs ~10% HW hashrate itself
+#include "hal/cpu_hal.h"
+static volatile uint64_t s_stat_hw_wait_cycles = 0;  // CPU cycles busy-waiting on the SHA engine
+#endif
 
 // Variables to hold data from custom textboxes
 //Track mining stats in non volatile memory
@@ -157,6 +172,7 @@ struct JobResult
   uint32_t nonce_count;
   double difficulty;
   uint8_t hash[32];
+  char src = '?';   // 'S' software kernel, 'H' hardware SHA
 };
 
 static std::mutex s_job_mutex;
@@ -550,6 +566,24 @@ void runStratumWorker(void *name) {
       job_result_list.pop_front();
 
       hashes += res->nonce_count;
+#ifdef DEBUG_HASH_STATS
+      if (res->src == 'H')
+        s_stat_nonces_hw += res->nonce_count;
+      else
+        s_stat_nonces_sw += res->nonce_count;
+#endif
+#ifdef DEBUG_NONCE_LOG
+      // One line per candidate, checked on the host by tools/validate_nonces.py
+      if (job_pool == res->id && res->nonce != 0xFFFFFFFF)
+      {
+        Serial.printf("NONCE src=%c job=%s en2=%s ntime=%s nonce=%08lx diff=%.9g hash=",
+                      res->src, mJob.job_id.c_str(), mWorker.extranonce2.c_str(), mJob.ntime.c_str(),
+                      (unsigned long)res->nonce, res->difficulty);
+        for (size_t i = 0; i < 32; i++)
+          Serial.printf("%02x", res->hash[i]);
+        Serial.println();
+      }
+#endif
       if (res->difficulty > currentPoolDifficulty && job_pool == res->id && res->nonce != 0xFFFFFFFF)
       {
         if (!client.connected())
@@ -616,6 +650,10 @@ void minerWorkerSw(void * task_id)
       result->nonce = 0xFFFFFFFF;
       result->id = job->id;
       result->nonce_count = job->nonce_count;
+      result->src = 'S';
+#ifdef DEBUG_NONCE_LOG
+      result->difficulty = 0; // report the best 16-bit candidate of every batch for host validation
+#endif
       uint8_t job_in_work = job->id & 0xFF;
       for (uint32_t n = 0; n < job->nonce_count; ++n)
       {
@@ -778,6 +816,23 @@ static inline void nerd_sha_hal_wait_idle()
     {}
 }
 
+// sha256d of header block 2 with nonce n, continuing from the HW midstate.
+// Caller holds the engine (esp_sha_acquire_hardware + SHA_MODE_REG).
+// Returns true and fills hash only if the 16-bit pre-filter passes.
+static inline __attribute__((always_inline)) bool nerd_hw_sha256d(const void *digest_mid, const void *sha_buffer, uint32_t n, uint8_t *hash)
+{
+    nerd_sha_ll_write_digest((void *)digest_mid);
+    nerd_sha_ll_fill_text_block_sha256(sha_buffer, n);
+    REG_WRITE(SHA_CONTINUE_REG, 1);
+    sha_ll_load(SHA2_256);
+    nerd_sha_hal_wait_idle();
+    nerd_sha_ll_fill_text_block_sha256_inter();
+    REG_WRITE(SHA_START_REG, 1);
+    sha_ll_load(SHA2_256);
+    nerd_sha_hal_wait_idle();
+    return nerd_sha_ll_read_digest_if(hash);
+}
+
 //#define VALIDATION
 void minerWorkerHw(void * task_id)
 {
@@ -822,6 +877,10 @@ void minerWorkerHw(void * task_id)
       result->nonce = 0xFFFFFFFF;
       result->nonce_count = job->nonce_count;
       result->difficulty = job->difficulty;
+      result->src = 'H';
+#ifdef DEBUG_NONCE_LOG
+      result->difficulty = 0; // report the best 16-bit candidate of every batch for host validation
+#endif
       uint8_t job_in_work = job->id & 0xFF;
       memcpy(digest_mid, job->midstate, sizeof(digest_mid));
       memcpy(sha_buffer, job->sha_buffer+64, sizeof(sha_buffer));
@@ -835,21 +894,7 @@ void minerWorkerHw(void * task_id)
       uint32_t nend = job->nonce_start + job->nonce_count;
       for (uint32_t n = job->nonce_start; n < nend; ++n)
       {
-        //nerd_sha_hal_wait_idle();
-        nerd_sha_ll_write_digest(digest_mid);
-        //nerd_sha_hal_wait_idle();
-        nerd_sha_ll_fill_text_block_sha256(sha_buffer, n);
-        //sha_ll_continue_block(SHA2_256);
-        REG_WRITE(SHA_CONTINUE_REG, 1);
-        
-        sha_ll_load(SHA2_256);
-        nerd_sha_hal_wait_idle();
-        nerd_sha_ll_fill_text_block_sha256_inter();
-        //sha_ll_start_block(SHA2_256);
-        REG_WRITE(SHA_START_REG, 1);
-        sha_ll_load(SHA2_256);
-        nerd_sha_hal_wait_idle();
-        if (nerd_sha_ll_read_digest_if(hash))
+        if (nerd_hw_sha256d(digest_mid, sha_buffer, n, hash))
         {
           //Serial.printf("Hw 16bit Share, nonce=0x%X\n", n);
 #ifdef VALIDATION
@@ -939,8 +984,17 @@ static inline void nerd_sha_ll_read_digest(void* ptr)
 
 static inline void nerd_sha_hal_wait_idle()
 {
+#ifdef DEBUG_HW_WAIT_STATS
+    uint32_t t0 = cpu_hal_get_cycle_count();
+#endif
     while (DPORT_REG_READ(SHA_256_BUSY_REG))
     {}
+#ifdef DEBUG_HW_WAIT_STATS
+    // skip deltas from a core migration (per-core CCOUNT), real waits are << 100k cycles
+    uint32_t d = cpu_hal_get_cycle_count() - t0;
+    if (d < 100000)
+      s_stat_hw_wait_cycles += d;
+#endif
 }
 
 static inline void nerd_sha_ll_fill_text_block_sha256(const void *input_text)
@@ -1029,6 +1083,26 @@ static inline void nerd_sha_ll_fill_text_block_sha256_double()
     reg_addr_buf[15] = 0x00000100;
 }
 
+// Full sha256d of the word-byteswapped header: no midstate load on this engine, so
+// block 1 is hashed every time. Caller holds the engine (esp_sha_lock_engine).
+// Returns true and fills hash only if the 16-bit pre-filter passes.
+static inline __attribute__((always_inline)) bool nerd_hw_sha256d(const uint8_t *sha_buffer, uint32_t nonce, uint8_t *hash)
+{
+    nerd_sha_ll_fill_text_block_sha256(sha_buffer);
+    sha_ll_start_block(SHA2_256);
+    nerd_sha_hal_wait_idle();
+    nerd_sha_ll_fill_text_block_sha256_upper(sha_buffer+64, nonce);
+    sha_ll_continue_block(SHA2_256);
+    nerd_sha_hal_wait_idle();
+    sha_ll_load(SHA2_256);
+    nerd_sha_hal_wait_idle();
+    nerd_sha_ll_fill_text_block_sha256_double();
+    sha_ll_start_block(SHA2_256);
+    nerd_sha_hal_wait_idle();
+    sha_ll_load(SHA2_256);
+    return nerd_sha_ll_read_digest_swap_if(hash);
+}
+
 void minerWorkerHw(void * task_id)
 {
   unsigned int miner_id = (uint32_t)task_id;
@@ -1063,35 +1137,17 @@ void minerWorkerHw(void * task_id)
       result->nonce = 0xFFFFFFFF;
       result->nonce_count = job->nonce_count;
       result->difficulty = job->difficulty;
+      result->src = 'H';
+#ifdef DEBUG_NONCE_LOG
+      result->difficulty = 0; // report the best 16-bit candidate of every batch for host validation
+#endif
       uint8_t job_in_work = job->id & 0xFF;
       memcpy(sha_buffer, job->sha_buffer, 80);
 
       esp_sha_lock_engine(SHA2_256);
       for (uint32_t n = 0; n < job->nonce_count; ++n)
       {
-        //((uint32_t*)(sha_buffer+64+12))[0] = __builtin_bswap32(job->nonce_start+n);
-
-        //sha_hal_hash_block(SHA2_256, s_test_buffer, 64/4, true);
-        //nerd_sha_hal_wait_idle();
-        nerd_sha_ll_fill_text_block_sha256(sha_buffer);
-        sha_ll_start_block(SHA2_256);
-
-        //sha_hal_hash_block(SHA2_256, s_test_buffer+64, 64/4, false);
-        nerd_sha_hal_wait_idle();
-        nerd_sha_ll_fill_text_block_sha256_upper(sha_buffer+64, job->nonce_start+n);
-        sha_ll_continue_block(SHA2_256);
-
-        nerd_sha_hal_wait_idle();
-        sha_ll_load(SHA2_256);
-
-        //sha_hal_hash_block(SHA2_256, interResult, 64/4, true);
-        nerd_sha_hal_wait_idle();
-        nerd_sha_ll_fill_text_block_sha256_double();
-        sha_ll_start_block(SHA2_256);
-
-        nerd_sha_hal_wait_idle();
-        sha_ll_load(SHA2_256);
-        if (nerd_sha_ll_read_digest_swap_if(hash))
+        if (nerd_hw_sha256d(sha_buffer, job->nonce_start+n, hash))
         {
           //~5 per second
           double diff_hash = diff_from_target(hash);
@@ -1124,6 +1180,94 @@ void minerWorkerHw(void * task_id)
 #endif  //CONFIG_IDF_TARGET_ESP32
 
 #endif  //HARDWARE_SHA265
+
+/****************** SHA256d SELF-TEST (KAT) ********************/
+
+// Bitcoin genesis block header (raw serialization) and its raw sha256d digest
+// (displayed as 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f)
+static const uint8_t kat_header[80] = {
+  0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e,
+  0x67, 0x76, 0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32, 0x3a, 0x9f, 0xb8, 0xaa,
+  0x4b, 0x1e, 0x5e, 0x4a, 0x29, 0xab, 0x5f, 0x49, 0xff, 0xff, 0x00, 0x1d, 0x1d, 0xac, 0x2b, 0x7c,
+};
+static const uint8_t kat_hash[32] = {
+  0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72, 0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f,
+  0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c, 0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+#define KAT_NONCE 0x7c2bac1dU  // header bytes 76..79 as little-endian word
+
+// KAT_NONCE must pass the 16-bit pre-filter with the exact digest, KAT_NONCE+1 must not
+static bool selftest_report(const char *path, bool hit, const uint8_t *hash, bool miss)
+{
+  bool ok = hit && memcmp(hash, kat_hash, sizeof(kat_hash)) == 0 && !miss;
+  Serial.printf("[KAT] %-4s sha256d genesis: %s\n", path, ok ? "OK" : "FAILED");
+  if (!ok)
+  {
+    Serial.printf("[KAT]   hit=%d miss=%d hash=", hit, miss);
+    for (size_t i = 0; i < 32; i++)
+      Serial.printf("%02x", hash[i]);
+    Serial.println();
+  }
+  return ok;
+}
+
+bool mining_selftest()
+{
+  bool ok = true;
+  uint32_t header32[32] = {0};  // word aligned, as the miner's sha buffers
+  uint8_t *header = (uint8_t *)header32;
+  uint8_t hash[32];
+  uint8_t scratch[32];
+  memcpy(header, kat_header, sizeof(kat_header));
+
+  // Software kernel: midstate + bake + baked double hash, as used by minerWorkerSw
+  {
+    uint32_t midstate[8];
+    uint32_t bake[16];
+    nerd_mids(midstate, header);
+    nerd_sha256_bake(midstate, header+64, bake);
+    memset(hash, 0, sizeof(hash));
+    bool hit = nerd_sha256d_baked(midstate, header+64, bake, hash);
+    header32[19] = KAT_NONCE + 1;
+    bool miss = nerd_sha256d_baked(midstate, header+64, bake, scratch);
+    header32[19] = KAT_NONCE;
+    ok &= selftest_report("SW", hit, hash, miss);
+  }
+
+#ifdef HARDWARE_SHA265
+  #if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
+  {
+    uint32_t hw_midstate[8];
+    esp_sha_acquire_hardware();
+    sha_hal_hash_block(SHA2_256, header, 64/4, true);
+    sha_hal_read_digest(SHA2_256, hw_midstate);
+    REG_WRITE(SHA_MODE_REG, SHA2_256);
+    memset(hash, 0, sizeof(hash));
+    bool hit = nerd_hw_sha256d(hw_midstate, header+64, KAT_NONCE, hash);
+    bool miss = nerd_hw_sha256d(hw_midstate, header+64, KAT_NONCE + 1, scratch);
+    esp_sha_release_hardware();
+    ok &= selftest_report("HW", hit, hash, miss);
+  }
+  #elif defined(CONFIG_IDF_TARGET_ESP32)
+  {
+    uint32_t swapped[32];
+    for (int i = 0; i < 32; ++i)
+      swapped[i] = __builtin_bswap32(header32[i]);
+    esp_sha_lock_engine(SHA2_256);
+    memset(hash, 0, sizeof(hash));
+    bool hit = nerd_hw_sha256d((const uint8_t *)swapped, KAT_NONCE, hash);
+    bool miss = nerd_hw_sha256d((const uint8_t *)swapped, KAT_NONCE + 1, scratch);
+    esp_sha_unlock_engine(SHA2_256);
+    ok &= selftest_report("HW", hit, hash, miss);
+  }
+  #endif
+#endif
+
+  Serial.flush(); // init_WifiManager() re-runs Serial.begin(), which drops unsent output
+  return ok;
+}
 
 
 #define DELAY 100
@@ -1252,6 +1396,17 @@ void runMonitor(void *name)
             isMinerSuscribed ? "true" : "false",
             client.connected() ? "true" : "false", isMinerSuscribed ? "true" : "false", WiFi.status() == WL_CONNECTED ? "true" : "false");
       }
+
+      #ifdef DEBUG_HASH_STATS
+      if (upTime % 5 == 0)
+        Serial.printf("STATS ms=%lu sw=%lu hw=%lu hw_wait_cyc=%llu\n", (unsigned long)now_millis,
+                      (unsigned long)s_stat_nonces_sw, (unsigned long)s_stat_nonces_hw,
+#ifdef DEBUG_HW_WAIT_STATS
+                      (unsigned long long)s_stat_hw_wait_cycles);
+#else
+                      0ULL);
+#endif
+      #endif
 
       #ifdef DEBUG_MEMORY
       Serial.printf("### [Total Heap / Free heap / Min free heap]: %d / %d / %d \n", ESP.getHeapSize(), ESP.getFreeHeap(), ESP.getMinFreeHeap());
