@@ -947,160 +947,121 @@ void minerWorkerHw(void * task_id)
 
 #if defined(CONFIG_IDF_TARGET_ESP32)
 
-static inline bool nerd_sha_ll_read_digest_swap_if(void* ptr)
+#include <esp_chip_info.h>
+
+// DPORT_REG_READ carries the workaround for the DPORT read erratum of chip revision 0/1
+// (interrupts off, APB pre-read, IRAM call), paid on every BUSY poll. Revision >= 2 can
+// read directly; mining_selftest() enables that only if the raw path also passes the KAT.
+static bool s_dport_raw = false;
+
+// Keeps the compiler from moving or dropping TEXT stores across engine commands
+#define SHA_CMD(cmd) do { __asm__ __volatile__("" ::: "memory"); cmd; } while (0)
+
+template <bool RAW>
+static inline uint32_t nerd_dport_read(uint32_t reg)
 {
-  DPORT_INTERRUPT_DISABLE();
-  uint32_t fin = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 7 * 4);
-  if ( (uint32_t)(fin & 0xFFFF) != 0)
-  {
-    DPORT_INTERRUPT_RESTORE();
+  return RAW ? _DPORT_REG_READ(reg) : DPORT_REG_READ(reg);
+}
+
+template <bool RAW>
+static inline void nerd_sha_wait_idle()
+{
+#ifdef DEBUG_HW_WAIT_STATS
+  uint32_t t0 = cpu_hal_get_cycle_count();
+#endif
+  __asm__ __volatile__("" ::: "memory");
+  while (nerd_dport_read<RAW>(SHA_256_BUSY_REG))
+  {}
+#ifdef DEBUG_HW_WAIT_STATS
+  // skip deltas from a core migration (per-core CCOUNT), real waits are << 100k cycles
+  uint32_t d = cpu_hal_get_cycle_count() - t0;
+  if (d < 100000)
+    s_stat_hw_wait_cycles += d;
+#endif
+}
+
+// 16-bit pre-filter on the outer digest in TEXT[0..7]; on a hit reads all of it
+template <bool RAW>
+static inline bool nerd_sha_read_digest_swap_if(uint8_t *hash)
+{
+  uint32_t fin = nerd_dport_read<RAW>(SHA_TEXT_BASE + 7 * 4);
+  if (fin & 0xFFFF)
     return false;
-  }
-  ((uint32_t*)ptr)[7] = __builtin_bswap32(fin);
-  ((uint32_t*)ptr)[0] = __builtin_bswap32(DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 0 * 4));
-  ((uint32_t*)ptr)[1] = __builtin_bswap32(DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 1 * 4));
-  ((uint32_t*)ptr)[2] = __builtin_bswap32(DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 2 * 4));
-  ((uint32_t*)ptr)[3] = __builtin_bswap32(DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 3 * 4));
-  ((uint32_t*)ptr)[4] = __builtin_bswap32(DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 4 * 4));
-  ((uint32_t*)ptr)[5] = __builtin_bswap32(DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 5 * 4));
-  ((uint32_t*)ptr)[6] = __builtin_bswap32(DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 6 * 4));
-  DPORT_INTERRUPT_RESTORE();
+  uint32_t *out = (uint32_t *)hash;
+  out[7] = __builtin_bswap32(fin);
+  for (int i = 0; i < 7; ++i)
+    out[i] = __builtin_bswap32(nerd_dport_read<RAW>(SHA_TEXT_BASE + i * 4));
   return true;
 }
 
-static inline void nerd_sha_ll_read_digest(void* ptr)
+// Busy delay of ~n loop iterations; stalls only make it longer, never shorter
+static inline void nerd_spin(uint32_t n)
 {
-  DPORT_INTERRUPT_DISABLE();
-  ((uint32_t*)ptr)[0] = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 0 * 4);
-  ((uint32_t*)ptr)[1] = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 1 * 4);
-  ((uint32_t*)ptr)[2] = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 2 * 4);
-  ((uint32_t*)ptr)[3] = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 3 * 4);
-  ((uint32_t*)ptr)[4] = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 4 * 4);
-  ((uint32_t*)ptr)[5] = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 5 * 4);
-  ((uint32_t*)ptr)[6] = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 6 * 4);
-  ((uint32_t*)ptr)[7] = DPORT_SEQUENCE_REG_READ(SHA_TEXT_BASE + 7 * 4);
-  DPORT_INTERRUPT_RESTORE();
+  while (n--)
+    __asm__ __volatile__("nop");
 }
 
-static inline void nerd_sha_hal_wait_idle()
+// Spins before the overlapped TEXT writes, which must not hit the words before the engine
+// has consumed them: [0] block 2 after START block 1, [1] outer padding after CONTINUE,
+// [2] block 1 tail after START outer. Minimum on rev3 silicon (NM_HW_CALIBRATE): 0, 2, 0.
+#define HW_SPIN_SAFE 200
+static uint32_t s_hw_spin[3] = {4, 8, 4};
+
+// sha256d of nonces [nonce, nonce+count) over the word-byteswapped header blk. This engine
+// cannot load a midstate, so block 1 is hashed for every nonce. The next block's words are
+// written while the current one is hashed, after s_hw_spin delays (see above).
+// Stops after the first nonce passing the 16-bit pre-filter (*hit set, hash filled).
+// Returns the number of nonces hashed. Caller holds the engine (esp_sha_lock_engine).
+template <bool RAW>
+static inline uint32_t nerd_hw_scan(const uint32_t *blk, uint32_t nonce, uint32_t count, uint8_t *hash, bool *hit)
 {
-#ifdef DEBUG_HW_WAIT_STATS
-    uint32_t t0 = cpu_hal_get_cycle_count();
-#endif
-    while (DPORT_REG_READ(SHA_256_BUSY_REG))
-    {}
-#ifdef DEBUG_HW_WAIT_STATS
-    // skip deltas from a core migration (per-core CCOUNT), real waits are << 100k cycles
-    uint32_t d = cpu_hal_get_cycle_count() - t0;
-    if (d < 100000)
-      s_stat_hw_wait_cycles += d;
-#endif
-}
-
-static inline void nerd_sha_ll_fill_text_block_sha256(const void *input_text)
-{
-    uint32_t *data_words = (uint32_t *)input_text;
-    uint32_t *reg_addr_buf = (uint32_t *)(SHA_TEXT_BASE);
-
-    reg_addr_buf[0]  = data_words[0];
-    reg_addr_buf[1]  = data_words[1];
-    reg_addr_buf[2]  = data_words[2];
-    reg_addr_buf[3]  = data_words[3];
-    reg_addr_buf[4]  = data_words[4];
-    reg_addr_buf[5]  = data_words[5];
-    reg_addr_buf[6]  = data_words[6];
-    reg_addr_buf[7]  = data_words[7];
-    reg_addr_buf[8]  = data_words[8];
-    reg_addr_buf[9]  = data_words[9];
-    reg_addr_buf[10] = data_words[10];
-    reg_addr_buf[11] = data_words[11];
-    reg_addr_buf[12] = data_words[12];
-    reg_addr_buf[13] = data_words[13];
-    reg_addr_buf[14] = data_words[14];
-    reg_addr_buf[15] = data_words[15];
-}
-
-static inline void nerd_sha_ll_fill_text_block_sha256_upper(const void *input_text, uint32_t nonce)
-{
-    uint32_t *data_words = (uint32_t *)input_text;
-    uint32_t *reg_addr_buf = (uint32_t *)(SHA_TEXT_BASE);
-
-    reg_addr_buf[0]  = data_words[0];
-    reg_addr_buf[1]  = data_words[1];
-    reg_addr_buf[2]  = data_words[2];
-    reg_addr_buf[3]  = __builtin_bswap32(nonce);
-#if 1
-    reg_addr_buf[4]  = 0x80000000;
-    reg_addr_buf[5]  = 0x00000000;
-    reg_addr_buf[6]  = 0x00000000;
-    reg_addr_buf[7]  = 0x00000000;
-    reg_addr_buf[8]  = 0x00000000;
-    reg_addr_buf[9]  = 0x00000000;
-    reg_addr_buf[10] = 0x00000000;
-    reg_addr_buf[11] = 0x00000000;
-    reg_addr_buf[12] = 0x00000000;
-    reg_addr_buf[13] = 0x00000000;
-    reg_addr_buf[14] = 0x00000000;
-    reg_addr_buf[15] = 0x00000280;
-#else
-    reg_addr_buf[4]  = data_words[4];
-    reg_addr_buf[5]  = data_words[5];
-    reg_addr_buf[6]  = data_words[6];
-    reg_addr_buf[7]  = data_words[7];
-    reg_addr_buf[8]  = data_words[8];
-    reg_addr_buf[9]  = data_words[9];
-    reg_addr_buf[10] = data_words[10];
-    reg_addr_buf[11] = data_words[11];
-    reg_addr_buf[12] = data_words[12];
-    reg_addr_buf[13] = data_words[13];
-    reg_addr_buf[14] = data_words[14];
-    reg_addr_buf[15] = data_words[15];
-#endif
-}
-
-static inline void nerd_sha_ll_fill_text_block_sha256_double()
-{
-    uint32_t *reg_addr_buf = (uint32_t *)(SHA_TEXT_BASE);
-
-#if 0
-    //No change
-    reg_addr_buf[0]  = data_words[0];
-    reg_addr_buf[1]  = data_words[1];
-    reg_addr_buf[2]  = data_words[2];
-    reg_addr_buf[3]  = data_words[3];
-    reg_addr_buf[4]  = data_words[4];
-    reg_addr_buf[5]  = data_words[5];
-    reg_addr_buf[6]  = data_words[6];
-    reg_addr_buf[7]  = data_words[7];
-#endif
-    reg_addr_buf[8]  = 0x80000000;
-    reg_addr_buf[9]  = 0x00000000;
-    reg_addr_buf[10] = 0x00000000;
-    reg_addr_buf[11] = 0x00000000;
-    reg_addr_buf[12] = 0x00000000;
-    reg_addr_buf[13] = 0x00000000;
-    reg_addr_buf[14] = 0x00000000;
-    reg_addr_buf[15] = 0x00000100;
-}
-
-// Full sha256d of the word-byteswapped header: no midstate load on this engine, so
-// block 1 is hashed every time. Caller holds the engine (esp_sha_lock_engine).
-// Returns true and fills hash only if the 16-bit pre-filter passes.
-static inline __attribute__((always_inline)) bool nerd_hw_sha256d(const uint8_t *sha_buffer, uint32_t nonce, uint8_t *hash)
-{
-    nerd_sha_ll_fill_text_block_sha256(sha_buffer);
-    sha_ll_start_block(SHA2_256);
-    nerd_sha_hal_wait_idle();
-    nerd_sha_ll_fill_text_block_sha256_upper(sha_buffer+64, nonce);
-    sha_ll_continue_block(SHA2_256);
-    nerd_sha_hal_wait_idle();
-    sha_ll_load(SHA2_256);
-    nerd_sha_hal_wait_idle();
-    nerd_sha_ll_fill_text_block_sha256_double();
-    sha_ll_start_block(SHA2_256);
-    nerd_sha_hal_wait_idle();
-    sha_ll_load(SHA2_256);
-    return nerd_sha_ll_read_digest_swap_if(hash);
+  uint32_t *text = (uint32_t *)SHA_TEXT_BASE;
+  *hit = false;
+  for (int j = 0; j < 16; ++j)
+    text[j] = blk[j];
+  SHA_CMD(sha_ll_start_block(SHA2_256));
+  for (uint32_t i = 0; i < count; ++i)
+  {
+    // block 2: header tail, nonce, padding (while block 1 runs)
+    nerd_spin(s_hw_spin[0]);
+    text[0] = blk[16];
+    text[1] = blk[17];
+    text[2] = blk[18];
+    text[3] = __builtin_bswap32(nonce + i);
+    text[4] = 0x80000000;
+    for (int j = 5; j < 15; ++j)
+      text[j] = 0;
+    text[15] = 0x00000280;
+    nerd_sha_wait_idle<RAW>();
+    SHA_CMD(sha_ll_continue_block(SHA2_256));
+    // outer hash padding (while block 2 runs), words 9..14 are already zero
+    nerd_spin(s_hw_spin[1]);
+    text[8] = 0x80000000;
+    text[15] = 0x00000100;
+    nerd_sha_wait_idle<RAW>();
+    SHA_CMD(sha_ll_load(SHA2_256));
+    nerd_sha_wait_idle<RAW>();
+    SHA_CMD(sha_ll_start_block(SHA2_256));
+    // block 1 tail of the next nonce (while the outer hash runs)
+    nerd_spin(s_hw_spin[2]);
+    for (int j = 8; j < 16; ++j)
+      text[j] = blk[j];
+    nerd_sha_wait_idle<RAW>();
+    SHA_CMD(sha_ll_load(SHA2_256));
+    nerd_sha_wait_idle<RAW>();
+    if (nerd_sha_read_digest_swap_if<RAW>(hash))
+    {
+      *hit = true;
+      return i + 1;
+    }
+    if (i + 1 < count)
+    {
+      for (int j = 0; j < 8; ++j)
+        text[j] = blk[j];
+      SHA_CMD(sha_ll_start_block(SHA2_256));
+    }
+  }
+  return count;
 }
 
 void minerWorkerHw(void * task_id)
@@ -1111,7 +1072,7 @@ void minerWorkerHw(void * task_id)
   std::shared_ptr<JobRequest> job;
   std::shared_ptr<JobResult> result;
   uint8_t hash[32];
-  uint8_t sha_buffer[128];
+  uint32_t sha_buffer[32];
 
   while (1)
   {
@@ -1145,27 +1106,30 @@ void minerWorkerHw(void * task_id)
       memcpy(sha_buffer, job->sha_buffer, 80);
 
       esp_sha_lock_engine(SHA2_256);
-      for (uint32_t n = 0; n < job->nonce_count; ++n)
+      uint32_t n = 0;
+      while (n < job->nonce_count)
       {
-        if (nerd_hw_sha256d(sha_buffer, job->nonce_start+n, hash))
+        // chunks end on multiples of 256 nonces, the stale-job check rate
+        uint32_t chunk = 256 - (n & 0xFF);
+        if (chunk > job->nonce_count - n)
+          chunk = job->nonce_count - n;
+        bool hit;
+        n += s_dport_raw ? nerd_hw_scan<true>(sha_buffer, job->nonce_start + n, chunk, hash, &hit)
+                         : nerd_hw_scan<false>(sha_buffer, job->nonce_start + n, chunk, hash, &hit);
+        if (hit)
         {
           //~5 per second
           double diff_hash = diff_from_target(hash);
-          if (diff_hash > result->difficulty)
+          if (diff_hash > result->difficulty && isSha256Valid(hash))
           {
-            if (isSha256Valid(hash))
-            {
-              result->difficulty = diff_hash;
-              result->nonce = job->nonce_start+n;
-              memcpy(result->hash, hash, sizeof(hash));
-            }
+            result->difficulty = diff_hash;
+            result->nonce = job->nonce_start + n - 1;
+            memcpy(result->hash, hash, sizeof(hash));
           }
         }
-        if (
-             (uint8_t)(n & 0xFF) == 0 &&
-             s_working_current_job_id != job_in_work)
+        else if (s_working_current_job_id != job_in_work)
         {
-          result->nonce_count = n+1;
+          result->nonce_count = n;
           break;
         }
       }
@@ -1213,6 +1177,24 @@ static bool selftest_report(const char *path, bool hit, const uint8_t *hash, boo
   return ok;
 }
 
+#if defined(HARDWARE_SHA265) && defined(CONFIG_IDF_TARGET_ESP32)
+// Single nonces (hit, miss) plus a 16-nonce scan that must stop at KAT_NONCE with the
+// exact digest, which also covers the pipelining across nonces
+template <bool RAW>
+static bool selftest_hw_scan(const uint32_t *blk, uint8_t *hash, bool *miss)
+{
+  bool hit, hit_scan;
+  uint8_t scan_hash[32];
+  memset(hash, 0, 32);
+  esp_sha_lock_engine(SHA2_256);
+  nerd_hw_scan<RAW>(blk, KAT_NONCE, 1, hash, &hit);
+  nerd_hw_scan<RAW>(blk, KAT_NONCE + 1, 1, scan_hash, miss);
+  uint32_t done = nerd_hw_scan<RAW>(blk, KAT_NONCE - 7, 16, scan_hash, &hit_scan);
+  esp_sha_unlock_engine(SHA2_256);
+  return hit && hit_scan && done == 8 && memcmp(scan_hash, kat_hash, sizeof(kat_hash)) == 0;
+}
+#endif
+
 bool mining_selftest()
 {
   bool ok = true;
@@ -1255,12 +1237,42 @@ bool mining_selftest()
     uint32_t swapped[32];
     for (int i = 0; i < 32; ++i)
       swapped[i] = __builtin_bswap32(header32[i]);
-    esp_sha_lock_engine(SHA2_256);
-    memset(hash, 0, sizeof(hash));
-    bool hit = nerd_hw_sha256d((const uint8_t *)swapped, KAT_NONCE, hash);
-    bool miss = nerd_hw_sha256d((const uint8_t *)swapped, KAT_NONCE + 1, scratch);
-    esp_sha_unlock_engine(SHA2_256);
+    bool miss;
+#ifdef NM_HW_CALIBRATE
+    for (int k = 0; k < 3; ++k)
+    {
+      uint32_t save = s_hw_spin[k];
+      for (uint32_t d = 0; d <= 64; d += 2)
+      {
+        s_hw_spin[k] = d;
+        bool pass = true;
+        for (int rep = 0; rep < 20 && pass; ++rep)
+          pass = selftest_hw_scan<false>(swapped, hash, &miss) && !miss && memcmp(hash, kat_hash, 32) == 0;
+        bool pass_raw = true;
+        for (int rep = 0; rep < 20 && pass_raw; ++rep)
+          pass_raw = selftest_hw_scan<true>(swapped, hash, &miss) && !miss && memcmp(hash, kat_hash, 32) == 0;
+        Serial.printf("[CAL] spin[%d]=%2u safe=%d raw=%d\n", k, (unsigned)d, pass, pass_raw);
+      }
+      s_hw_spin[k] = save;
+    }
+#endif
+    bool hit = selftest_hw_scan<false>(swapped, hash, &miss);
+    if (!hit || miss)
+    {
+      // unknown silicon: fall back to long delays (slower, but the engine is done reading)
+      s_hw_spin[0] = s_hw_spin[1] = s_hw_spin[2] = HW_SPIN_SAFE;
+      hit = selftest_hw_scan<false>(swapped, hash, &miss);
+      Serial.printf("[KAT] HW tuned delays failed, safe delays: %s\n", hit && !miss ? "OK" : "FAILED");
+    }
     ok &= selftest_report("HW", hit, hash, miss);
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    if (ok && chip.revision >= 2)
+    {
+      hit = selftest_hw_scan<true>(swapped, hash, &miss);
+      s_dport_raw = selftest_report("HWr", hit, hash, miss);
+      ok &= s_dport_raw;
+    }
   }
   #endif
 #endif
