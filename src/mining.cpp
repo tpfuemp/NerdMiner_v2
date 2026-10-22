@@ -954,14 +954,17 @@ void minerWorkerHw(void * task_id)
 // read directly; mining_selftest() enables that only if the raw path also passes the KAT.
 static bool s_dport_raw = false;
 
-// Keeps the compiler from moving or dropping TEXT stores across engine commands
-#define SHA_CMD(cmd) do { __asm__ __volatile__("" ::: "memory"); cmd; } while (0)
-
 template <bool RAW>
 static inline uint32_t nerd_dport_read(uint32_t reg)
 {
   return RAW ? _DPORT_REG_READ(reg) : DPORT_REG_READ(reg);
 }
+
+// Engine command without the memw GCC emits before volatile stores (+1.6% on classic ESP32).
+// Stores leave the store buffer in order, so it lands after the TEXT words; the "memory" clobber
+// keeps the compiler from moving them. BUSY polls keep their memw, a read must not overtake a
+// queued command.
+#define SHA_CMD_REG(reg) __asm__ __volatile__("s32i %0, %1, 0" :: "r"(1), "r"(reg) : "memory")
 
 template <bool RAW>
 static inline void nerd_sha_wait_idle()
@@ -1025,7 +1028,7 @@ static inline uint32_t nerd_hw_scan(const uint32_t *blk, uint32_t nonce, uint32_
   *hit = false;
   for (int j = 0; j < 16; ++j)
     text[j] = blk[j];
-  SHA_CMD(sha_ll_start_block(SHA2_256));
+  SHA_CMD_REG(SHA_256_START_REG);
   for (uint32_t i = 0; i < count; ++i)
   {
     // block 2: header tail, nonce, padding (while block 1 runs)
@@ -1039,21 +1042,21 @@ static inline uint32_t nerd_hw_scan(const uint32_t *blk, uint32_t nonce, uint32_
       text[j] = 0;
     text[15] = 0x00000280;
     nerd_sha_wait_idle<RAW>();
-    SHA_CMD(sha_ll_continue_block(SHA2_256));
+    SHA_CMD_REG(SHA_256_CONTINUE_REG);
     // outer hash padding (while block 2 runs), words 9..14 are already zero
     nerd_spin(s_hw_spin[1]);
     text[8] = 0x80000000;
     text[15] = 0x00000100;
     nerd_sha_wait_idle<RAW>();
-    SHA_CMD(sha_ll_load(SHA2_256));
+    SHA_CMD_REG(SHA_256_LOAD_REG);
     nerd_sha_wait_idle<RAW>();
-    SHA_CMD(sha_ll_start_block(SHA2_256));
+    SHA_CMD_REG(SHA_256_START_REG);
     // block 1 tail of the next nonce (while the outer hash runs)
     nerd_spin(s_hw_spin[2]);
     for (int j = 8; j < 16; ++j)
       text[j] = blk[j];
     nerd_sha_wait_idle<RAW>();
-    SHA_CMD(sha_ll_load(SHA2_256));
+    SHA_CMD_REG(SHA_256_LOAD_REG);
     nerd_sha_wait_idle<RAW>();
     if (nerd_sha_read_digest_swap_if<RAW>(hash))
     {
@@ -1064,7 +1067,7 @@ static inline uint32_t nerd_hw_scan(const uint32_t *blk, uint32_t nonce, uint32_
     {
       for (int j = 0; j < 8; ++j)
         text[j] = blk[j];
-      SHA_CMD(sha_ll_start_block(SHA2_256));
+      SHA_CMD_REG(SHA_256_START_REG);
     }
   }
   return count;
